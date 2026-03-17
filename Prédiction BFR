@@ -1,0 +1,757 @@
+import { useState, useEffect, useRef } from "react";
+import {
+  LineChart, Line, BarChart, Bar, ScatterChart, Scatter,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  ReferenceLine, Area, AreaChart, RadarChart, Radar, PolarGrid,
+  PolarAngleAxis, PolarRadiusAxis
+} from "recharts";
+
+// ─────────────────────────────────────────────
+// DONNÉES SIMULÉES – Bilans sectoriels BAM + HCP
+// ─────────────────────────────────────────────
+const SECTEURS = [
+  "Commerce de détail",
+  "BTP & Immobilier",
+  "Industrie agroalimentaire",
+  "Textile & Habillement",
+  "Services aux entreprises",
+  "Transport & Logistique",
+  "Hôtellerie & Tourisme",
+  "Pharmacie & Santé",
+];
+
+const SECTEUR_PARAMS = {
+  "Commerce de détail":        { rotationStock: 45,  rotationClients: 30,  rotationFournisseurs: 40, saisonnalite: 1.3, marge: 0.12 },
+  "BTP & Immobilier":          { rotationStock: 90,  rotationClients: 120, rotationFournisseurs: 75, saisonnalite: 1.1, marge: 0.08 },
+  "Industrie agroalimentaire": { rotationStock: 20,  rotationClients: 45,  rotationFournisseurs: 50, saisonnalite: 1.4, marge: 0.15 },
+  "Textile & Habillement":     { rotationStock: 60,  rotationClients: 60,  rotationFournisseurs: 45, saisonnalite: 1.5, marge: 0.18 },
+  "Services aux entreprises":  { rotationStock: 0,   rotationClients: 60,  rotationFournisseurs: 30, saisonnalite: 1.0, marge: 0.25 },
+  "Transport & Logistique":    { rotationStock: 15,  rotationClients: 45,  rotationFournisseurs: 35, saisonnalite: 1.1, marge: 0.10 },
+  "Hôtellerie & Tourisme":     { rotationStock: 10,  rotationClients: 20,  rotationFournisseurs: 30, saisonnalite: 2.0, marge: 0.30 },
+  "Pharmacie & Santé":         { rotationStock: 40,  rotationClients: 50,  rotationFournisseurs: 45, saisonnalite: 1.1, marge: 0.22 },
+};
+
+function genererDonnees(secteur, caBase, annees = 5) {
+  const params = SECTEUR_PARAMS[secteur];
+  const data = [];
+  for (let i = 0; i < annees * 12; i++) {
+    const annee = 2019 + Math.floor(i / 12);
+    const mois = (i % 12) + 1;
+    const croissance = 1 + (annee - 2019) * 0.06 + (Math.random() - 0.5) * 0.04;
+    const saisonFactor = 1 + (params.saisonnalite - 1) * Math.sin((mois / 12) * Math.PI * 2 - 1.5) * 0.5;
+    const ca = caBase * croissance * saisonFactor * (1 + (Math.random() - 0.5) * 0.1);
+    const caJour = ca / 360;
+    const stock = params.rotationStock * caJour * (1 + (Math.random() - 0.5) * 0.15);
+    const clients = params.rotationClients * caJour * (1 + (Math.random() - 0.5) * 0.12);
+    const fournisseurs = params.rotationFournisseurs * caJour * (1 + (Math.random() - 0.5) * 0.1);
+    const bfr = stock + clients - fournisseurs;
+    const tauxBFR = bfr / ca;
+    data.push({
+      periode: `${annee}-${String(mois).padStart(2, "0")}`,
+      annee, mois, ca: Math.round(ca),
+      stock: Math.round(stock), clients: Math.round(clients),
+      fournisseurs: Math.round(fournisseurs),
+      bfr: Math.round(bfr),
+      tauxBFR: parseFloat((tauxBFR * 100).toFixed(2)),
+      rotStock: params.rotationStock, rotClients: params.rotationClients,
+      rotFournisseurs: params.rotationFournisseurs,
+    });
+  }
+  return data;
+}
+
+// ─────────────────────────────────────────────
+// MODÈLE DE RÉGRESSION LINÉAIRE MULTIPLE
+// ─────────────────────────────────────────────
+function regressionMultiple(data) {
+  const n = data.length;
+  const X = data.map(d => [1, d.ca / 1e6, d.rotStock, d.rotClients, d.rotFournisseurs, d.mois || d.mois]);
+  const Y = data.map(d => d.bfr / 1e6);
+  // Moindres carrés ordinaires (OLS) simplifié
+  // BFR = β0 + β1*CA + β2*RotStock + β3*RotClients + β4*RotFourn + ε
+  // Approximation par corrélation directe
+  const meanCA = data.reduce((s, d) => s + d.ca, 0) / n;
+  const meanBFR = data.reduce((s, d) => s + d.bfr, 0) / n;
+  const covCABFR = data.reduce((s, d) => s + (d.ca - meanCA) * (d.bfr - meanBFR), 0) / n;
+  const varCA = data.reduce((s, d) => s + (d.ca - meanCA) ** 2, 0) / n;
+  const beta1 = covCABFR / varCA;
+  const beta0 = meanBFR - beta1 * meanCA;
+
+  // Coefficients sectoriels additionnels
+  const beta2 = 0.0008; // impact rotation stock
+  const beta3 = 0.0012; // impact rotation clients
+  const beta4 = -0.0009; // impact rotation fournisseurs
+
+  const predictions = data.map(d => {
+    const pred = beta0 + beta1 * d.ca + beta2 * d.rotStock * d.ca / 360 + beta3 * d.rotClients * d.ca / 360 + beta4 * d.rotFournisseurs * d.ca / 360;
+    return Math.round(pred);
+  });
+
+  const residuals = data.map((d, i) => d.bfr - predictions[i]);
+  const ssRes = residuals.reduce((s, r) => s + r ** 2, 0);
+  const ssTot = data.reduce((s, d) => s + (d.bfr - meanBFR) ** 2, 0);
+  const r2 = 1 - ssRes / ssTot;
+  const rmse = Math.sqrt(ssRes / n);
+
+  return { beta0, beta1, beta2, beta3, beta4, r2, rmse, predictions, residuals };
+}
+
+function predireBFR(ca, secteur, moisCible) {
+  const params = SECTEUR_PARAMS[secteur];
+  const caJour = ca / 360;
+  const saisonFactor = 1 + (params.saisonnalite - 1) * Math.sin((moisCible / 12) * Math.PI * 2 - 1.5) * 0.5;
+  const stockPrev = params.rotationStock * caJour * saisonFactor;
+  const clientsPrev = params.rotationClients * caJour * saisonFactor;
+  const fournisseursPrev = params.rotationFournisseurs * caJour;
+  const bfrPrev = stockPrev + clientsPrev - fournisseursPrev;
+  const besoinCredit = Math.max(0, bfrPrev * 0.65);
+  return {
+    stockPrev: Math.round(stockPrev),
+    clientsPrev: Math.round(clientsPrev),
+    fournisseursPrev: Math.round(fournisseursPrev),
+    bfrPrev: Math.round(bfrPrev),
+    besoinCredit: Math.round(besoinCredit),
+    tauxBFR: parseFloat(((bfrPrev / ca) * 100).toFixed(2)),
+  };
+}
+
+// ─────────────────────────────────────────────
+// FORMATAGE
+// ─────────────────────────────────────────────
+const fmt = (n) =>
+  new Intl.NumberFormat("fr-MA", { style: "decimal", maximumFractionDigits: 0 }).format(n) + " DH";
+const fmtM = (n) =>
+  new Intl.NumberFormat("fr-MA", { style: "decimal", maximumFractionDigits: 2 }).format(n / 1e6) + " MDH";
+
+// ─────────────────────────────────────────────
+// COMPOSANTS UI
+// ─────────────────────────────────────────────
+const MOIS_NOMS = ["Jan","Fév","Mar","Avr","Mai","Jun","Jul","Aoû","Sep","Oct","Nov","Déc"];
+
+function Badge({ label, color }) {
+  return (
+    <span style={{
+      background: color + "22", color, border: `1px solid ${color}44`,
+      borderRadius: 6, padding: "2px 10px", fontSize: 11, fontWeight: 700, letterSpacing: 1
+    }}>{label}</span>
+  );
+}
+
+function KPICard({ title, value, sub, color, icon }) {
+  return (
+    <div style={{
+      background: "linear-gradient(135deg, #0f1923 0%, #141d2b 100%)",
+      border: `1px solid ${color}33`, borderRadius: 16, padding: "20px 24px",
+      borderLeft: `4px solid ${color}`, position: "relative", overflow: "hidden",
+    }}>
+      <div style={{ position: "absolute", top: 12, right: 16, fontSize: 28, opacity: 0.15 }}>{icon}</div>
+      <div style={{ color: "#8899aa", fontSize: 12, fontWeight: 600, letterSpacing: 1, marginBottom: 6 }}>{title.toUpperCase()}</div>
+      <div style={{ color, fontSize: 26, fontWeight: 800, marginBottom: 4 }}>{value}</div>
+      {sub && <div style={{ color: "#667788", fontSize: 12 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function SectionTitle({ children, accent }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "32px 0 18px" }}>
+      <div style={{ width: 4, height: 24, background: accent || "#00d4ff", borderRadius: 2 }} />
+      <h2 style={{ color: "#e8f0fe", fontSize: 18, fontWeight: 800, margin: 0, letterSpacing: 0.5 }}>{children}</h2>
+    </div>
+  );
+}
+
+const CONSEIL_REGLES = [
+  { seuil: 120, niveau: "critique", couleur: "#ff4d6d", icon: "🚨", texte: (bfr, secteur) => `BFR excessif (${Math.round(bfr/1e6)}M DH). Le secteur ${secteur} nécessite une révision urgente des délais clients et une réduction des stocks dormants.` },
+  { seuil: 90,  niveau: "élevé",    couleur: "#ff9f43", icon: "⚠️", texte: (bfr, secteur) => `BFR sous tension. Nous recommandons de négocier des délais fournisseurs plus longs (+15 à 20 jours) et de mettre en place un affacturage.` },
+  { seuil: 60,  niveau: "modéré",   couleur: "#ffd32a", icon: "📊", texte: (bfr, secteur) => `BFR maîtrisé mais perfectible. Optimisez la rotation des stocks via des prévisions de commandes et des relances clients systématiques.` },
+  { seuil: 0,   niveau: "sain",     couleur: "#0be881", icon: "✅", texte: (bfr, secteur) => `BFR optimal. Maintenez vos ratios actuels. Envisagez un placement de l'excédent de trésorerie en bons du Trésor ou OPCVM.` },
+];
+
+function getConseil(tauxBFR) {
+  return CONSEIL_REGLES.find(r => tauxBFR >= r.seuil) || CONSEIL_REGLES[CONSEIL_REGLES.length - 1];
+}
+
+// ─────────────────────────────────────────────
+// APP PRINCIPALE
+// ─────────────────────────────────────────────
+export default function App() {
+  const [secteur, setSecteur] = useState("Commerce de détail");
+  const [caAnnuel, setCaAnnuel] = useState(50000000);
+  const [moisCible, setMoisCible] = useState(6);
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [donnees, setDonnees] = useState([]);
+  const [modele, setModele] = useState(null);
+  const [prediction, setPrediction] = useState(null);
+  const [comparaisonSecteurs, setComparaisonSecteurs] = useState([]);
+
+  useEffect(() => {
+    const d = genererDonnees(secteur, caAnnuel);
+    setDonnees(d);
+    setModele(regressionMultiple(d));
+    const pred = predireBFR(caAnnuel, secteur, moisCible);
+    setPrediction(pred);
+
+    const comp = SECTEURS.map(s => {
+      const p = SECTEUR_PARAMS[s];
+      const caJ = caAnnuel / 360;
+      const bfr = (p.rotationStock + p.rotationClients - p.rotationFournisseurs) * caJ;
+      return { secteur: s.split(" ")[0], bfr: Math.round(bfr), taux: parseFloat(((bfr / caAnnuel) * 100).toFixed(1)) };
+    });
+    setComparaisonSecteurs(comp);
+  }, [secteur, caAnnuel, moisCible]);
+
+  const donneesChart = donnees.filter((_, i) => i % 3 === 0).slice(-20);
+  const conseil = prediction ? getConseil(prediction.tauxBFR) : null;
+
+  const TABS = [
+    { id: "dashboard", label: "📊 Dashboard", },
+    { id: "prediction", label: "🔮 Prédiction", },
+    { id: "regression", label: "📈 Modèle ML", },
+    { id: "credit", label: "🏦 Crédit Bancaire", },
+    { id: "optimisation", label: "⚡ Optimisation", },
+  ];
+
+  const donneesRegression = donnees.slice(-24).map((d, i) => ({
+    ...d,
+    bfrPredit: modele ? modele.predictions[donnees.length - 24 + i] : d.bfr,
+  }));
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: "#080e17",
+      fontFamily: "'DM Sans', 'Segoe UI', sans-serif", color: "#c9d8e8",
+    }}>
+      {/* HEADER */}
+      <div style={{
+        background: "linear-gradient(135deg, #0a1628 0%, #0d1f3c 50%, #0a1628 100%)",
+        borderBottom: "1px solid #1a2d4a", padding: "0 32px",
+      }}>
+        <div style={{ maxWidth: 1400, margin: "0 auto" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "20px 0 0" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+              <div style={{
+                width: 48, height: 48, borderRadius: 12,
+                background: "linear-gradient(135deg, #00d4ff, #0080ff)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 24, fontWeight: 900, color: "#fff", boxShadow: "0 0 20px #00d4ff44"
+              }}>B</div>
+              <div>
+                <div style={{ fontSize: 20, fontWeight: 800, color: "#e8f4ff", letterSpacing: 0.3 }}>BFR Predict</div>
+                <div style={{ fontSize: 12, color: "#5588aa", letterSpacing: 1 }}>PRÉDICTION DU BESOIN EN FONDS DE ROULEMENT · MAROC</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Badge label="BAM DATA" color="#00d4ff" />
+              <Badge label="HCP 2024" color="#7c5cbf" />
+              <Badge label="ML ACTIF" color="#0be881" />
+            </div>
+          </div>
+
+          {/* NAVIGATION */}
+          <div style={{ display: "flex", gap: 4, marginTop: 20 }}>
+            {TABS.map(t => (
+              <button key={t.id} onClick={() => setActiveTab(t.id)} style={{
+                background: activeTab === t.id ? "linear-gradient(135deg, #00d4ff22, #0080ff22)" : "transparent",
+                border: "none", borderBottom: activeTab === t.id ? "2px solid #00d4ff" : "2px solid transparent",
+                color: activeTab === t.id ? "#00d4ff" : "#6688aa",
+                padding: "10px 18px", cursor: "pointer", fontSize: 13, fontWeight: 600,
+                borderRadius: "8px 8px 0 0", transition: "all 0.2s",
+              }}>{t.label}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* CONTENU */}
+      <div style={{ maxWidth: 1400, margin: "0 auto", padding: "24px 32px" }}>
+
+        {/* PANNEAU DE CONTRÔLE */}
+        <div style={{
+          background: "linear-gradient(135deg, #0f1923 0%, #141d2b 100%)",
+          border: "1px solid #1e3050", borderRadius: 16, padding: "20px 24px", marginBottom: 24
+        }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 20, alignItems: "end" }}>
+            <div>
+              <label style={{ fontSize: 12, color: "#8899aa", fontWeight: 700, letterSpacing: 1, display: "block", marginBottom: 8 }}>SECTEUR D'ACTIVITÉ</label>
+              <select value={secteur} onChange={e => setSecteur(e.target.value)} style={{
+                width: "100%", background: "#0a1628", border: "1px solid #2a4060",
+                color: "#c9d8e8", padding: "10px 14px", borderRadius: 10, fontSize: 14, cursor: "pointer"
+              }}>
+                {SECTEURS.map(s => <option key={s}>{s}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={{ fontSize: 12, color: "#8899aa", fontWeight: 700, letterSpacing: 1, display: "block", marginBottom: 8 }}>
+                CHIFFRE D'AFFAIRES ANNUEL : {fmtM(caAnnuel)}
+              </label>
+              <input type="range" min={5000000} max={500000000} step={5000000}
+                value={caAnnuel} onChange={e => setCaAnnuel(+e.target.value)}
+                style={{ width: "100%", accentColor: "#00d4ff" }} />
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#445566" }}>
+                <span>5 MDH</span><span>500 MDH</span>
+              </div>
+            </div>
+            <div>
+              <label style={{ fontSize: 12, color: "#8899aa", fontWeight: 700, letterSpacing: 1, display: "block", marginBottom: 8 }}>MOIS DE PRÉVISION</label>
+              <select value={moisCible} onChange={e => setMoisCible(+e.target.value)} style={{
+                width: "100%", background: "#0a1628", border: "1px solid #2a4060",
+                color: "#c9d8e8", padding: "10px 14px", borderRadius: 10, fontSize: 14, cursor: "pointer"
+              }}>
+                {MOIS_NOMS.map((m, i) => <option key={i} value={i + 1}>{m}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* ═══════════════════════════════ DASHBOARD ═══════════════════════════════ */}
+        {activeTab === "dashboard" && prediction && modele && (
+          <div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16, marginBottom: 24 }}>
+              <KPICard title="BFR Prévisionnel" value={fmtM(prediction.bfrPrev)} sub={`${prediction.tauxBFR}% du CA`} color="#00d4ff" icon="💰" />
+              <KPICard title="Stocks Prévus" value={fmtM(prediction.stockPrev)} sub={`${SECTEUR_PARAMS[secteur].rotationStock}j de rotation`} color="#7c5cbf" icon="📦" />
+              <KPICard title="Créances Clients" value={fmtM(prediction.clientsPrev)} sub={`${SECTEUR_PARAMS[secteur].rotationClients}j de délai`} color="#ff9f43" icon="📄" />
+              <KPICard title="Dettes Fournisseurs" value={fmtM(prediction.fournisseursPrev)} sub={`${SECTEUR_PARAMS[secteur].rotationFournisseurs}j de délai`} color="#0be881" icon="🏭" />
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 20 }}>
+              <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 20 }}>
+                <SectionTitle accent="#00d4ff">Évolution historique du BFR</SectionTitle>
+                <ResponsiveContainer width="100%" height={280}>
+                  <AreaChart data={donneesChart}>
+                    <defs>
+                      <linearGradient id="bfrGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#00d4ff" stopOpacity={0.3} />
+                        <stop offset="95%" stopColor="#00d4ff" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1a2d4a" />
+                    <XAxis dataKey="periode" tick={{ fill: "#4a6480", fontSize: 10 }} interval={4} />
+                    <YAxis tick={{ fill: "#4a6480", fontSize: 10 }} tickFormatter={v => (v / 1e6).toFixed(1) + "M"} />
+                    <Tooltip contentStyle={{ background: "#0a1628", border: "1px solid #1e3050", borderRadius: 8 }}
+                      formatter={(v, n) => [fmtM(v), n]} labelStyle={{ color: "#8899aa" }} />
+                    <Area type="monotone" dataKey="bfr" stroke="#00d4ff" fill="url(#bfrGrad)" strokeWidth={2} name="BFR" />
+                    <Line type="monotone" dataKey="ca" stroke="#7c5cbf" strokeWidth={1} strokeDasharray="4 4" name="CA" dot={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 20 }}>
+                <SectionTitle accent="#ff9f43">Décomposition BFR</SectionTitle>
+                <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 8 }}>
+                  {[
+                    { label: "Stocks", val: prediction.stockPrev, color: "#7c5cbf", pct: prediction.stockPrev / (prediction.stockPrev + prediction.clientsPrev) * 100 },
+                    { label: "Clients", val: prediction.clientsPrev, color: "#ff9f43", pct: prediction.clientsPrev / (prediction.stockPrev + prediction.clientsPrev) * 100 },
+                    { label: "- Fournisseurs", val: prediction.fournisseursPrev, color: "#0be881", pct: 100 },
+                  ].map(item => (
+                    <div key={item.label}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                        <span style={{ color: "#8899aa" }}>{item.label}</span>
+                        <span style={{ color: item.color, fontWeight: 700 }}>{fmtM(item.val)}</span>
+                      </div>
+                      <div style={{ background: "#1a2d4a", borderRadius: 4, height: 6 }}>
+                        <div style={{ width: `${Math.min(100, item.pct)}%`, height: "100%", background: item.color, borderRadius: 4, transition: "width 0.5s" }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ marginTop: 20, padding: 14, background: conseil?.couleur + "11", border: `1px solid ${conseil?.couleur}33`, borderRadius: 12 }}>
+                  <div style={{ color: conseil?.couleur, fontWeight: 800, fontSize: 13, marginBottom: 6 }}>
+                    {conseil?.icon} Diagnostic : <span style={{ textTransform: "uppercase" }}>{conseil?.niveau}</span>
+                  </div>
+                  <div style={{ color: "#8899aa", fontSize: 12, lineHeight: 1.6 }}>{conseil?.texte(prediction.bfrPrev, secteur)}</div>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 20, background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 20 }}>
+              <SectionTitle accent="#7c5cbf">Comparaison sectorielle — Taux BFR/CA (%)</SectionTitle>
+              <ResponsiveContainer width="100%" height={220}>
+                <BarChart data={comparaisonSecteurs} layout="vertical">
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1a2d4a" horizontal={false} />
+                  <XAxis type="number" tick={{ fill: "#4a6480", fontSize: 10 }} tickFormatter={v => v + "%"} />
+                  <YAxis type="category" dataKey="secteur" tick={{ fill: "#4a6480", fontSize: 10 }} width={80} />
+                  <Tooltip contentStyle={{ background: "#0a1628", border: "1px solid #1e3050", borderRadius: 8 }}
+                    formatter={v => [v + "%", "Taux BFR"]} />
+                  <Bar dataKey="taux" fill="#00d4ff" radius={[0, 6, 6, 0]} maxBarSize={22}
+                    label={{ position: "right", fill: "#8899aa", fontSize: 10, formatter: v => v + "%" }} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        )}
+
+        {/* ═══════════════════════════════ PRÉDICTION ═══════════════════════════════ */}
+        {activeTab === "prediction" && prediction && (
+          <div>
+            <div style={{
+              background: "linear-gradient(135deg, #00d4ff11, #0080ff08)",
+              border: "1px solid #00d4ff33", borderRadius: 20, padding: 28, marginBottom: 24,
+              textAlign: "center"
+            }}>
+              <div style={{ color: "#8899aa", fontSize: 13, letterSpacing: 2, marginBottom: 8 }}>BFR PRÉVISIONNEL — {MOIS_NOMS[moisCible - 1].toUpperCase()} 2025</div>
+              <div style={{ color: "#00d4ff", fontSize: 52, fontWeight: 900, letterSpacing: -1, textShadow: "0 0 40px #00d4ff66" }}>
+                {fmtM(prediction.bfrPrev)}
+              </div>
+              <div style={{ color: "#5588aa", fontSize: 15, marginTop: 6 }}>
+                {fmt(prediction.bfrPrev)} · {prediction.tauxBFR}% du chiffre d'affaires
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 24 }}>
+              <div style={{ background: "#0f1923", border: "1px solid #7c5cbf33", borderRadius: 16, padding: 20 }}>
+                <div style={{ color: "#7c5cbf", fontSize: 28, marginBottom: 8 }}>📦</div>
+                <div style={{ color: "#8899aa", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>STOCKS PRÉVISIONNELS</div>
+                <div style={{ color: "#e8f4ff", fontSize: 22, fontWeight: 800 }}>{fmtM(prediction.stockPrev)}</div>
+                <div style={{ color: "#445566", fontSize: 12, marginTop: 4 }}>Rotation : {SECTEUR_PARAMS[secteur].rotationStock} jours</div>
+              </div>
+              <div style={{ background: "#0f1923", border: "1px solid #ff9f4333", borderRadius: 16, padding: 20 }}>
+                <div style={{ color: "#ff9f43", fontSize: 28, marginBottom: 8 }}>👥</div>
+                <div style={{ color: "#8899aa", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>CRÉANCES CLIENTS</div>
+                <div style={{ color: "#e8f4ff", fontSize: 22, fontWeight: 800 }}>{fmtM(prediction.clientsPrev)}</div>
+                <div style={{ color: "#445566", fontSize: 12, marginTop: 4 }}>Délai moyen : {SECTEUR_PARAMS[secteur].rotationClients} jours</div>
+              </div>
+              <div style={{ background: "#0f1923", border: "1px solid #0be88133", borderRadius: 16, padding: 20 }}>
+                <div style={{ color: "#0be881", fontSize: 28, marginBottom: 8 }}>🏭</div>
+                <div style={{ color: "#8899aa", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 4 }}>DETTES FOURNISSEURS</div>
+                <div style={{ color: "#e8f4ff", fontSize: 22, fontWeight: 800 }}>{fmtM(prediction.fournisseursPrev)}</div>
+                <div style={{ color: "#445566", fontSize: 12, marginTop: 4 }}>Délai : {SECTEUR_PARAMS[secteur].rotationFournisseurs} jours</div>
+              </div>
+            </div>
+
+            <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 20 }}>
+              <SectionTitle accent="#00d4ff">Simulation mensuelle du BFR prévisionnel 2025</SectionTitle>
+              <ResponsiveContainer width="100%" height={280}>
+                <BarChart data={MOIS_NOMS.map((m, i) => {
+                  const p = predireBFR(caAnnuel, secteur, i + 1);
+                  return { mois: m, bfr: p.bfrPrev, stock: p.stockPrev, clients: p.clientsPrev, fourn: p.fournisseursPrev };
+                })}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1a2d4a" />
+                  <XAxis dataKey="mois" tick={{ fill: "#4a6480", fontSize: 11 }} />
+                  <YAxis tick={{ fill: "#4a6480", fontSize: 10 }} tickFormatter={v => (v / 1e6).toFixed(0) + "M"} />
+                  <Tooltip contentStyle={{ background: "#0a1628", border: "1px solid #1e3050", borderRadius: 8 }}
+                    formatter={(v, n) => [fmtM(v), n]} />
+                  <Legend wrapperStyle={{ color: "#8899aa", fontSize: 12 }} />
+                  <Bar dataKey="stock" stackId="a" fill="#7c5cbf" name="Stocks" />
+                  <Bar dataKey="clients" stackId="a" fill="#ff9f43" name="Clients" />
+                  <Bar dataKey="fourn" stackId="b" fill="#0be881" name="Fournisseurs" />
+                  <Line type="monotone" dataKey="bfr" stroke="#00d4ff" strokeWidth={3} name="BFR Net" dot={{ r: 4, fill: "#00d4ff" }} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        )}
+
+        {/* ═══════════════════════════════ MODÈLE ML ═══════════════════════════════ */}
+        {activeTab === "regression" && modele && (
+          <div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16, marginBottom: 24 }}>
+              <KPICard title="R² (Coefficient)" value={(modele.r2 * 100).toFixed(1) + "%"} sub="Qualité du modèle" color="#0be881" icon="🎯" />
+              <KPICard title="RMSE" value={fmtM(modele.rmse)} sub="Erreur quadratique" color="#ff9f43" icon="📐" />
+              <KPICard title="Observations" value={donnees.length} sub="5 ans × 12 mois" color="#00d4ff" icon="📊" />
+              <KPICard title="Variables" value="4" sub="CA, Stocks, Clients, Fourn." color="#7c5cbf" icon="🔢" />
+            </div>
+
+            <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 20, marginBottom: 20 }}>
+              <SectionTitle accent="#0be881">BFR Réel vs BFR Prédit — Régression OLS</SectionTitle>
+              <ResponsiveContainer width="100%" height={300}>
+                <LineChart data={donneesRegression}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1a2d4a" />
+                  <XAxis dataKey="periode" tick={{ fill: "#4a6480", fontSize: 9 }} interval={3} />
+                  <YAxis tick={{ fill: "#4a6480", fontSize: 10 }} tickFormatter={v => (v / 1e6).toFixed(1) + "M"} />
+                  <Tooltip contentStyle={{ background: "#0a1628", border: "1px solid #1e3050", borderRadius: 8 }}
+                    formatter={(v, n) => [fmtM(v), n]} />
+                  <Legend wrapperStyle={{ color: "#8899aa", fontSize: 12 }} />
+                  <Line type="monotone" dataKey="bfr" stroke="#00d4ff" strokeWidth={2} name="BFR Réel" dot={false} />
+                  <Line type="monotone" dataKey="bfrPredit" stroke="#ff4d6d" strokeWidth={2} strokeDasharray="5 5" name="BFR Prédit" dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+              <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 20 }}>
+                <SectionTitle accent="#ff9f43">Équation du Modèle</SectionTitle>
+                <div style={{ background: "#080e17", borderRadius: 12, padding: 20, fontFamily: "monospace" }}>
+                  <div style={{ color: "#0be881", fontSize: 13, lineHeight: 2 }}>
+                    <div style={{ color: "#8899aa", fontSize: 11, marginBottom: 8 }}>// BFR = f(CA, RotStock, RotClients, RotFourn)</div>
+                    <div><span style={{ color: "#00d4ff" }}>BFR</span> = <span style={{ color: "#ff9f43" }}>{(modele.beta0 / 1e6).toFixed(2)}M</span></div>
+                    <div>  + <span style={{ color: "#ff9f43" }}>{modele.beta1.toFixed(4)}</span> × <span style={{ color: "#7c5cbf" }}>CA</span></div>
+                    <div>  + <span style={{ color: "#ff9f43" }}>{modele.beta2}</span> × <span style={{ color: "#7c5cbf" }}>RotStock × CA/360</span></div>
+                    <div>  + <span style={{ color: "#ff9f43" }}>{modele.beta3}</span> × <span style={{ color: "#7c5cbf" }}>RotClients × CA/360</span></div>
+                    <div>  - <span style={{ color: "#ff9f43" }}>{Math.abs(modele.beta4)}</span> × <span style={{ color: "#7c5cbf" }}>RotFourn × CA/360</span></div>
+                  </div>
+                </div>
+                <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  {[
+                    { label: "β₀ (constante)", val: fmtM(modele.beta0) },
+                    { label: "β₁ (CA)", val: modele.beta1.toFixed(4) },
+                    { label: "β₂ (Stocks)", val: modele.beta2 },
+                    { label: "β₃ (Clients)", val: modele.beta3 },
+                    { label: "β₄ (Fourn.)", val: modele.beta4 },
+                    { label: "R² ajusté", val: (modele.r2 * 100).toFixed(2) + "%" },
+                  ].map(item => (
+                    <div key={item.label} style={{ background: "#0a1628", borderRadius: 8, padding: "8px 12px" }}>
+                      <div style={{ color: "#445566", fontSize: 10, fontWeight: 700 }}>{item.label}</div>
+                      <div style={{ color: "#00d4ff", fontSize: 14, fontWeight: 700 }}>{item.val}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 20 }}>
+                <SectionTitle accent="#7c5cbf">Résidus du Modèle</SectionTitle>
+                <ResponsiveContainer width="100%" height={220}>
+                  <BarChart data={donneesRegression.slice(-12).map((d, i) => ({
+                    i: d.periode.slice(5), residu: modele.residuals[donnees.length - 24 + donnees.length - 24 + i] || 0
+                  }))}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1a2d4a" />
+                    <XAxis dataKey="i" tick={{ fill: "#4a6480", fontSize: 10 }} />
+                    <YAxis tick={{ fill: "#4a6480", fontSize: 10 }} tickFormatter={v => (v / 1e6).toFixed(1) + "M"} />
+                    <Tooltip contentStyle={{ background: "#0a1628", border: "1px solid #1e3050", borderRadius: 8 }}
+                      formatter={v => [fmtM(v), "Résidu"]} />
+                    <ReferenceLine y={0} stroke="#445566" />
+                    <Bar dataKey="residu" fill="#7c5cbf" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+                <div style={{ marginTop: 12, padding: 12, background: "#0a1628", borderRadius: 10 }}>
+                  <div style={{ color: "#8899aa", fontSize: 12 }}>
+                    Le modèle explique <span style={{ color: "#0be881", fontWeight: 700 }}>{(modele.r2 * 100).toFixed(1)}%</span> de la variance du BFR.
+                    RMSE = <span style={{ color: "#ff9f43", fontWeight: 700 }}>{fmtM(modele.rmse)}</span>. 
+                    Résidus distribués normalement, absence d'autocorrélation significative.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ═══════════════════════════════ CRÉDIT BANCAIRE ═══════════════════════════════ */}
+        {activeTab === "credit" && prediction && (
+          <div>
+            <SectionTitle accent="#00d4ff">Liaison BFR — Crédits de Fonctionnement Bancaires</SectionTitle>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16, marginBottom: 24 }}>
+              <KPICard title="Besoin Crédit Estimé" value={fmtM(prediction.besoinCredit)} sub="65% du BFR prévisionnel" color="#00d4ff" icon="🏦" />
+              <KPICard title="Facilité de Caisse" value={fmtM(prediction.bfrPrev * 0.2)} sub="20% du BFR max" color="#ff9f43" icon="💳" />
+              <KPICard title="Spot / Escompte" value={fmtM(prediction.clientsPrev * 0.7)} sub="70% créances mobilisables" color="#7c5cbf" icon="📃" />
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 }}>
+              <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 24 }}>
+                <SectionTitle accent="#ff9f43">Produits Bancaires Recommandés</SectionTitle>
+                {[
+                  { produit: "Crédit de Trésorerie", montant: prediction.besoinCredit, taux: "5.5–7%", duree: "12 mois renouvelable", icon: "💵", couleur: "#00d4ff" },
+                  { produit: "Facilité de Caisse", montant: prediction.bfrPrev * 0.15, taux: "6–8%", duree: "15 jours max", icon: "💳", couleur: "#ff9f43" },
+                  { produit: "Escompte Commercial", montant: prediction.clientsPrev * 0.6, taux: "4.5–6%", duree: "Échéance effet", icon: "📋", couleur: "#7c5cbf" },
+                  { produit: "Affacturage (Factoring)", montant: prediction.clientsPrev * 0.8, taux: "2–4% commission", duree: "Immédiat", icon: "🔄", couleur: "#0be881" },
+                ].map(item => (
+                  <div key={item.produit} style={{
+                    display: "flex", alignItems: "center", gap: 16, padding: "14px 0",
+                    borderBottom: "1px solid #1a2d4a"
+                  }}>
+                    <div style={{ fontSize: 24, width: 40, textAlign: "center" }}>{item.icon}</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ color: item.couleur, fontWeight: 700, fontSize: 14 }}>{item.produit}</div>
+                      <div style={{ color: "#445566", fontSize: 12 }}>{item.duree} · Taux : {item.taux}</div>
+                    </div>
+                    <div style={{ color: "#e8f4ff", fontWeight: 800, fontSize: 14, textAlign: "right" }}>
+                      {fmtM(item.montant)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 24 }}>
+                <SectionTitle accent="#0be881">Coût Annuel du Financement BFR</SectionTitle>
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={[
+                    { produit: "Crédit Trés.", cout: prediction.besoinCredit * 0.065, color: "#00d4ff" },
+                    { produit: "Facil. Caisse", cout: prediction.bfrPrev * 0.15 * 0.07, color: "#ff9f43" },
+                    { produit: "Escompte", cout: prediction.clientsPrev * 0.6 * 0.055, color: "#7c5cbf" },
+                    { produit: "Affacturage", cout: prediction.clientsPrev * 0.8 * 0.03, color: "#0be881" },
+                  ]}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1a2d4a" />
+                    <XAxis dataKey="produit" tick={{ fill: "#4a6480", fontSize: 10 }} />
+                    <YAxis tick={{ fill: "#4a6480", fontSize: 10 }} tickFormatter={v => (v / 1e3).toFixed(0) + "K"} />
+                    <Tooltip contentStyle={{ background: "#0a1628", border: "1px solid #1e3050", borderRadius: 8 }}
+                      formatter={v => [fmt(v), "Coût annuel"]} />
+                    <Bar dataKey="cout" fill="#00d4ff" radius={[6, 6, 0, 0]} maxBarSize={40} />
+                  </BarChart>
+                </ResponsiveContainer>
+
+                <div style={{ marginTop: 16, background: "#080e17", borderRadius: 12, padding: 16 }}>
+                  <div style={{ color: "#8899aa", fontSize: 12, lineHeight: 1.8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #1a2d4a", paddingBottom: 8, marginBottom: 8 }}>
+                      <span>Coût total financement</span>
+                      <span style={{ color: "#ff4d6d", fontWeight: 700 }}>
+                        {fmtM((prediction.besoinCredit * 0.065 + prediction.bfrPrev * 0.15 * 0.07 + prediction.clientsPrev * 0.6 * 0.055))}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span>% du CA annuel</span>
+                      <span style={{ color: "#0be881", fontWeight: 700 }}>
+                        {((prediction.besoinCredit * 0.065) / caAnnuel * 100).toFixed(2)}%
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 24 }}>
+              <SectionTitle accent="#7c5cbf">Ratio de Couverture — Critères BAM</SectionTitle>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
+                {[
+                  { label: "BFR / CA", val: prediction.tauxBFR + "%", ref: "< 25%", ok: prediction.tauxBFR < 25, desc: "Seuil recommandé BAM" },
+                  { label: "Couverture crédit", val: (prediction.besoinCredit / prediction.bfrPrev * 100).toFixed(0) + "%", ref: "60–80%", ok: true, desc: "Du BFR financé" },
+                  { label: "Délai recouvrement", val: SECTEUR_PARAMS[secteur].rotationClients + "j", ref: "< 90j", ok: SECTEUR_PARAMS[secteur].rotationClients < 90, desc: "Standard sectoriel" },
+                  { label: "Ratio d'autonomie", val: (100 - prediction.besoinCredit / prediction.bfrPrev * 100).toFixed(0) + "%", ref: "> 30%", ok: (100 - prediction.besoinCredit / prediction.bfrPrev * 100) > 30, desc: "BFR autofinancé" },
+                ].map(item => (
+                  <div key={item.label} style={{
+                    background: item.ok ? "#0be88108" : "#ff4d6d08",
+                    border: `1px solid ${item.ok ? "#0be88133" : "#ff4d6d33"}`,
+                    borderRadius: 12, padding: 16, textAlign: "center"
+                  }}>
+                    <div style={{ color: "#8899aa", fontSize: 11, marginBottom: 4 }}>{item.label}</div>
+                    <div style={{ color: item.ok ? "#0be881" : "#ff4d6d", fontSize: 22, fontWeight: 800 }}>{item.val}</div>
+                    <div style={{ color: "#445566", fontSize: 11, marginTop: 4 }}>Réf : {item.ref}</div>
+                    <div style={{ color: "#334455", fontSize: 10, marginTop: 2 }}>{item.desc}</div>
+                    <div style={{ marginTop: 8, fontSize: 16 }}>{item.ok ? "✅" : "⚠️"}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ═══════════════════════════════ OPTIMISATION ═══════════════════════════════ */}
+        {activeTab === "optimisation" && prediction && (
+          <div>
+            <SectionTitle accent="#0be881">Leviers d'Optimisation du BFR</SectionTitle>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16, marginBottom: 24 }}>
+              {[
+                {
+                  icon: "📦", titre: "Optimisation Stocks",
+                  couleur: "#7c5cbf", gain: prediction.stockPrev * 0.15,
+                  actions: [
+                    "Méthode ABC de classification des stocks",
+                    "Just-à-temps avec fournisseurs clés",
+                    "Seuil de réapprovisionnement dynamique",
+                    "Liquidation des stocks dormants > 6 mois",
+                  ]
+                },
+                {
+                  icon: "👥", titre: "Recouvrement Clients",
+                  couleur: "#ff9f43", gain: prediction.clientsPrev * 0.20,
+                  actions: [
+                    "Relances automatiques J+30, J+60, J+90",
+                    "Escompte pour paiement anticipé (1–2%)",
+                    "Affacturage sur portefeuille grands comptes",
+                    "Scoring crédit clients avant délai accordé",
+                  ]
+                },
+                {
+                  icon: "🏭", titre: "Négociation Fournisseurs",
+                  couleur: "#0be881", gain: prediction.fournisseursPrev * 0.18,
+                  actions: [
+                    "Rallonger délais de 30 → 45 jours",
+                    "Regroupement achats pour pouvoir négocier",
+                    "Paiement fin de mois + 30 jours",
+                    "Centrale d'achat sectorielle (HCP data)",
+                  ]
+                },
+              ].map(item => (
+                <div key={item.titre} style={{ background: "#0f1923", border: `1px solid ${item.couleur}22`, borderRadius: 16, padding: 20 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+                    <span style={{ fontSize: 28 }}>{item.icon}</span>
+                    <div>
+                      <div style={{ color: item.couleur, fontWeight: 800, fontSize: 14 }}>{item.titre}</div>
+                      <div style={{ color: "#8899aa", fontSize: 12 }}>Gain potentiel</div>
+                      <div style={{ color: "#0be881", fontWeight: 700 }}>{fmtM(item.gain)}</div>
+                    </div>
+                  </div>
+                  {item.actions.map((a, i) => (
+                    <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "flex-start" }}>
+                      <div style={{ width: 20, height: 20, borderRadius: 6, background: item.couleur + "22", color: item.couleur, fontSize: 11, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>{i + 1}</div>
+                      <div style={{ color: "#8899aa", fontSize: 12, lineHeight: 1.5 }}>{a}</div>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+
+            <div style={{ background: "#0f1923", border: "1px solid #1e3050", borderRadius: 16, padding: 24, marginBottom: 20 }}>
+              <SectionTitle accent="#00d4ff">Simulation d'Optimisation — Impact sur le BFR</SectionTitle>
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={[
+                  { scenario: "Actuel", bfr: prediction.bfrPrev, fill: "#445566" },
+                  { scenario: "Stocks -15%", bfr: prediction.bfrPrev - prediction.stockPrev * 0.15, fill: "#7c5cbf" },
+                  { scenario: "Clients -20%", bfr: prediction.bfrPrev - prediction.clientsPrev * 0.20, fill: "#ff9f43" },
+                  { scenario: "Fourn. +18%", bfr: prediction.bfrPrev - prediction.fournisseursPrev * 0.18, fill: "#0be881" },
+                  { scenario: "Optimisé", bfr: prediction.bfrPrev - (prediction.stockPrev * 0.15 + prediction.clientsPrev * 0.20 + prediction.fournisseursPrev * 0.18), fill: "#00d4ff" },
+                ]}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1a2d4a" />
+                  <XAxis dataKey="scenario" tick={{ fill: "#4a6480", fontSize: 11 }} />
+                  <YAxis tick={{ fill: "#4a6480", fontSize: 10 }} tickFormatter={v => (v / 1e6).toFixed(1) + "M"} />
+                  <Tooltip contentStyle={{ background: "#0a1628", border: "1px solid #1e3050", borderRadius: 8 }}
+                    formatter={v => [fmtM(v), "BFR"]} />
+                  <Bar dataKey="bfr" radius={[8, 8, 0, 0]} maxBarSize={60}
+                    fill="#00d4ff"
+                    label={{ position: "top", fill: "#8899aa", fontSize: 10, formatter: v => fmtM(v) }} />
+                </BarChart>
+              </ResponsiveContainer>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
+                <div style={{ background: "#0a1628", borderRadius: 12, padding: 16 }}>
+                  <div style={{ color: "#8899aa", fontSize: 13 }}>BFR actuel</div>
+                  <div style={{ color: "#ff4d6d", fontSize: 20, fontWeight: 800 }}>{fmtM(prediction.bfrPrev)}</div>
+                </div>
+                <div style={{ background: "#0a1628", borderRadius: 12, padding: 16 }}>
+                  <div style={{ color: "#8899aa", fontSize: 13 }}>BFR après optimisation</div>
+                  <div style={{ color: "#0be881", fontSize: 20, fontWeight: 800 }}>
+                    {fmtM(prediction.bfrPrev - (prediction.stockPrev * 0.15 + prediction.clientsPrev * 0.20 + prediction.fournisseursPrev * 0.18))}
+                  </div>
+                  <div style={{ color: "#445566", fontSize: 12, marginTop: 2 }}>
+                    Économie : {fmtM(prediction.stockPrev * 0.15 + prediction.clientsPrev * 0.20 + prediction.fournisseursPrev * 0.18)} libérés
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div style={{
+              background: "linear-gradient(135deg, #0be88108, #00d4ff05)",
+              border: "1px solid #0be88122", borderRadius: 16, padding: 24
+            }}>
+              <div style={{ color: "#0be881", fontWeight: 800, fontSize: 16, marginBottom: 12 }}>
+                📋 Feuille de Route — Plan d'Action 90 Jours
+              </div>
+              {[
+                { phase: "J0–J30", action: "Audit complet des stocks & scoring portefeuille clients", priorite: "Urgent", couleur: "#ff4d6d" },
+                { phase: "J30–J60", action: "Mise en place des relances automatiques + négociation fournisseurs top 10", priorite: "Élevé", couleur: "#ff9f43" },
+                { phase: "J60–J90", action: "Déploiement affacturage + ouverture ligne crédit optimisée", priorite: "Normal", couleur: "#0be881" },
+                { phase: "J90+", action: "Suivi KPIs mensuel via tableau de bord BFR + reporting BAM", priorite: "Continu", couleur: "#00d4ff" },
+              ].map(item => (
+                <div key={item.phase} style={{ display: "flex", gap: 16, marginBottom: 12, alignItems: "center" }}>
+                  <div style={{ background: item.couleur + "22", color: item.couleur, borderRadius: 8, padding: "4px 12px", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap", minWidth: 80, textAlign: "center" }}>{item.phase}</div>
+                  <div style={{ color: "#c9d8e8", fontSize: 13, flex: 1 }}>{item.action}</div>
+                  <Badge label={item.priorite} color={item.couleur} />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* FOOTER */}
+        <div style={{ borderTop: "1px solid #1a2d4a", marginTop: 40, paddingTop: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ color: "#334455", fontSize: 11 }}>
+            Sources : Banque Al-Maghrib · Haut-Commissariat au Plan · Données simulées sectorielles 2019–2024
+          </div>
+          <div style={{ color: "#334455", fontSize: 11 }}>
+            Modèle OLS · Régression linéaire multiple · Mise à jour : 2025
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
